@@ -1,5 +1,7 @@
+import argparse
 import timeit
 import statistics
+import torch.cuda.nvtx as nvtx
 
 import torch
 
@@ -38,46 +40,44 @@ MODEL_CONFIGS = {
     },
 }
 
-
-# From Section 2.1.2
 VOCAB_SIZE = 10_000
-BATCH_SIZE = 4
-CONTEXT_LENGTH = 512
 
-# From benchmarking problem (b)
-WARMUP_STEPS = 5
-MEASUREMENT_STEPS = 10
 
-# GPU benchmarking
-DEVICE = "cuda"
-
-def build_model(model_size: str):
+def build_model(
+    model_size: str,
+    context_length: int,
+    device: str,
+):
     config = MODEL_CONFIGS[model_size]
 
     model = BasicsTransformerLM(
         vocab_size=VOCAB_SIZE,
-        context_length=CONTEXT_LENGTH,
+        context_length=context_length,
         d_model=config["d_model"],
         num_layers=config["num_layers"],
         num_heads=config["num_heads"],
         d_ff=config["d_ff"],
     )
 
-    return model.to(DEVICE)
+    return model.to(device)
 
-def make_batch():
+def make_batch(
+    batch_size: int,
+    context_length: int,
+    device: str,
+):
     x = torch.randint(
         low=0,
         high=VOCAB_SIZE,
-        size=(BATCH_SIZE, CONTEXT_LENGTH),
-        device=DEVICE,
+        size=(batch_size, context_length),
+        device=device,
     )
 
     y = torch.randint(
         low=0,
         high=VOCAB_SIZE,
-        size=(BATCH_SIZE, CONTEXT_LENGTH),
-        device=DEVICE,
+        size=(batch_size, context_length),
+        device=device,
     )
 
     return x,y
@@ -91,84 +91,220 @@ def run_step(
 ):
     if mode == "forward":
         with torch.no_grad():
-            model(x)
+            with nvtx.range("forward"):
+                model(x)
 
     elif mode == "forward_backward":
         model.zero_grad(set_to_none=True)
 
-        logits = model(x)
+        with nvtx.range("forward"):
+            logits = model(x)
 
-        loss = torch.nn.functional.cross_entropy(
-            logits.reshape(-1,VOCAB_SIZE),
-            y.reshape(-1)
-        )
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1,VOCAB_SIZE),
+                y.reshape(-1)
+            )
 
-        loss.backward()
+        with nvtx.range("backward"):
+            loss.backward()
 
     elif mode == "train":
         optimizer.zero_grad(set_to_none=True)
-        
-        logits = model(x)
-        
-        loss = torch.nn.functional.cross_entropy(
-            logits.reshape(-1,VOCAB_SIZE),
-            y.reshape(-1)
-        )
-        
-        loss.backward()
 
-        optimizer.step()
+        with nvtx.range("forward"):
+            logits = model(x)
+        
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1,VOCAB_SIZE),
+                y.reshape(-1)
+            )
+
+        with nvtx.range("backward"):
+            loss.backward()
+
+        with nvtx.range("optimizer"):
+            optimizer.step()
 
     else:
         raise ValueError(
             f"Unknown mode: {mode}"
         )
 
+def synchronize(device: str):
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
 
-model = build_model("small")
-x, y = make_batch()
+def benchmark(
+    model,
+    x,
+    y,
+    mode,
+    optimizer,
+    warmup_steps,
+    measurement_steps,
+    device,
+):
+    with nvtx.range("warmup"):
+        for _ in range(warmup_steps):
+            run_step(
+                model,
+                x,
+                y,
+                mode,
+                optimizer,
+            )
 
-optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=1e-3,
-)
+            synchronize(device)
 
-mode = "forward"
+    times = []
 
-for _ in range(WARMUP_STEPS):
-    run_step(
-        model,
-        x,
-        y,
-        mode,
-        optimizer,
+    with nvtx.range("measurement_steps"):
+        for _ in range(measurement_steps):
+            synchronize(device)
+
+            start = timeit.default_timer()
+
+            run_step(
+                model,
+                x,
+                y,
+                mode,
+                optimizer,
+            )
+
+            synchronize(device)
+
+            end = timeit.default_timer()
+
+            time = end - start
+
+            times.append(time)
+
+    mean_time = statistics.mean(times)
+    std_time = (
+        statistics.stdev(times)
+        if len(times) > 1
+        else 0.0
     )
 
-times = []
+    return mean_time, std_time
+    
 
-for _ in range(MEASUREMENT_STEPS):
-    start = timeit.default_timer()
+def main():
+    parser = argparse.ArgumentParser()
 
-    run_step(
-        model,
-        x,
-        y,
-        mode,
-        optimizer,
+    parser.add_argument(
+        "--model-size",
+        choices=MODEL_CONFIGS.keys(),
+        default="small",
     )
 
-    torch.cuda.synchronize()
+    parser.add_argument(
+        "--mode",
+        choices=[
+            "forward",
+            "forward_backward",
+            "train",
+        ],
+        default="forward",
+    )
 
-    end = timeit.default_timer()
+    parser.add_argument(
+        "--context-length",
+        type=int,
+        default=512,
+    )
 
-    time = end - start
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+    )
 
-    times.append(time)
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=5,
+    )
 
-mean_time = statistics.mean(times)
-std_time = statistics.stdev(times)
+    parser.add_argument(
+        "--measurement-steps",
+        type=int,
+        default=10,
+    )
 
-print(f"mean = {mean_time:.6f} s")
-print(f"std  = {std_time:.6f} s")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+    )
+
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+
+    if args.context_length <= 0:
+        raise ValueError("context_length must be positive")
+
+    if args.batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    if args.warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+
+    if args.measurement_steps <= 0:
+        raise ValueError("measurement_steps must be positive")
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested, but no CUDA GPU is available.")
 
 
+    model = build_model(
+        args.model_size,
+        args.context_length,
+        args.device,
+    )
+
+    if args.mode == "forward":
+        model.eval()
+    else:
+        model.train()
+
+    x, y = make_batch(
+        args.batch_size,
+        args.context_length,
+        args.device,
+    )
+
+    optimizer = None
+
+    if args.mode == "train":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=1e-3,
+        )
+
+    mean_time, std_time = benchmark(
+        model=model,
+        x=x,
+        y=y,
+        mode=args.mode,
+        optimizer=optimizer,
+        warmup_steps=args.warmup_steps,
+        measurement_steps=args.measurement_steps,
+        device=args.device,
+    )
+
+    print(f"mean = {mean_time * 1000:.3f} ms")
+    print(f"std  = {std_time * 1000:.3f} ms")
+
+
+
+if __name__ == "__main__":
+    main()
