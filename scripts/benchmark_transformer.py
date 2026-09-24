@@ -100,6 +100,7 @@ def run_step(
         with nvtx.range("forward"):
             logits = model(x)
 
+        with nvtx.range("loss"):
             loss = torch.nn.functional.cross_entropy(
                 logits.reshape(-1,VOCAB_SIZE),
                 y.reshape(-1)
@@ -113,7 +114,8 @@ def run_step(
 
         with nvtx.range("forward"):
             logits = model(x)
-        
+
+        with nvtx.range("loss"):
             loss = torch.nn.functional.cross_entropy(
                 logits.reshape(-1,VOCAB_SIZE),
                 y.reshape(-1)
